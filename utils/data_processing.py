@@ -241,8 +241,16 @@ class DataProcessor:
         
         self.vocab_size = len(self.token2id)
         
+        # Verify max token ID matches vocab_size
+        max_id = max(self.id2token.keys())
+        if max_id >= self.vocab_size:
+            print(f"⚠️  Warning: Max token ID ({max_id}) >= vocab_size ({self.vocab_size})")
+            print(f"   Adjusting vocab_size to {max_id + 1} to accommodate all tokens")
+            self.vocab_size = max_id + 1
+        
         print(f"Loaded tokenizer from {model_dir}")
         print(f"Vocab size: {self.vocab_size}")
+        print(f"Max token ID: {max_id}")
         print(f"Special tokens - PAD: {self.pad_idx}, UNK: {self.unk_idx}, "
               f"SOS: {self.sos_idx}, EOS: {self.eos_idx}")
     

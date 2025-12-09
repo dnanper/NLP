@@ -1,6 +1,7 @@
-vocab_size: 32000
+vocab_size: 32002
 num_bpe_merges: 35000
 max_token_length: 18
 num_characters: 458
 training_samples: 500000
 timestamp: 2025-12-02 07:34:40
+note: Actual vocab includes IDs 0-32001 (32002 tokens total including special tokens)
