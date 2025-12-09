@@ -1,0 +1,6 @@
+vocab_size: 32000
+num_bpe_merges: 35000
+max_token_length: 18
+num_characters: 458
+training_samples: 500000
+timestamp: 2025-12-02 07:34:40
