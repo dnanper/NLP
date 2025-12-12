@@ -6,38 +6,46 @@ Translate sentences or files using trained model
 
 import torch
 from pathlib import Path
-import pickle
+import sys
+import os
 from typing import List, Optional
 import time
+from tqdm import tqdm
+import json
+
+# Add parent directory to path
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from models_best import BestTransformer, TransformerConfig
+from utils.data_processing import DataProcessor
+from config import Config
 
 
 class Translator:
     """
-    Translator for inference
+    Translator for inference using trained SentencePiece tokenizer
     """
     
-    def __init__(self, checkpoint_path: str, vocab_path: str, device: str = 'cuda'):
+    def __init__(self, checkpoint_path: str, tokenizer_dir: str, device: str = 'cuda'):
         """
         Args:
             checkpoint_path: Path to trained model checkpoint
-            vocab_path: Path to vocabulary.txt
+            tokenizer_dir: Directory containing tokenizer model
             device: Device to run on
         """
         print("Loading translator...")
         
-        # Load checkpoint
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+        # Load checkpoint (weights_only=False for PyTorch 2.6+)
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         self.config = checkpoint['config']
         self.config.device = device
         
-        # Load vocabulary
-        self.vocab = self._load_vocab(vocab_path)
-        self.id2token = {i: token for token, i in self.vocab.items()}
+        # Initialize data processor with tokenizer
+        self.processor = DataProcessor(Config)
+        self.processor.load_tokenizer(tokenizer_dir)
         
         # Create model
-        vocab_size = len(self.vocab)
+        vocab_size = self.processor.vocab_size
         self.model = BestTransformer(
             src_vocab_size=vocab_size,
             tgt_vocab_size=vocab_size,
@@ -46,6 +54,7 @@ class Translator:
         
         # Load weights
         self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.model.to(device)
         self.model.eval()
         
         print(f"✓ Model loaded from {checkpoint_path}")
@@ -53,62 +62,29 @@ class Translator:
         print(f"  Vocab size: {vocab_size}")
         print(f"  Best val loss: {checkpoint.get('best_val_loss', 'N/A')}")
     
-    def _load_vocab(self, vocab_path: str) -> dict:
-        """Load vocabulary from file"""
-        vocab = {}
-        with open(vocab_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-                
-                parts = line.split('\t')
-                if len(parts) == 2:
-                    token_id, token = parts
-                    vocab[token] = int(token_id)
-        
-        # Add special tokens if not present
-        if '<PAD>' not in vocab:
-            vocab['<PAD>'] = 0
-        if '<UNK>' not in vocab:
-            vocab['<UNK>'] = 1
-        if '<SOS>' not in vocab:
-            vocab['<SOS>'] = 2
-        if '<EOS>' not in vocab:
-            vocab['<EOS>'] = 3
-        
-        return vocab
-    
     def tokenize(self, text: str) -> List[int]:
         """
-        Tokenize text to token IDs
+        Tokenize text to token IDs using SentencePiece
         
-        Note: This is a simple word-level tokenizer
-        In production, use your trained BPE tokenizer
+        Args:
+            text: Input text
+            
+        Returns:
+            List of token IDs
         """
-        # Simple whitespace tokenization
-        tokens = text.strip().split()
-        
-        # Add BOS and EOS
-        token_ids = [self.vocab.get('<SOS>', 2)]
-        
-        for token in tokens:
-            token_id = self.vocab.get(token, self.vocab.get('<UNK>', 1))
-            token_ids.append(token_id)
-        
-        token_ids.append(self.vocab.get('<EOS>', 3))
-        
-        return token_ids
+        return self.processor.encode_sentence(text, add_sos=True, add_eos=True)
     
     def detokenize(self, token_ids: List[int]) -> str:
-        """Convert token IDs back to text"""
-        tokens = []
-        for token_id in token_ids:
-            token = self.id2token.get(token_id, '<UNK>')
-            if token not in ['<PAD>', '<SOS>', '<EOS>', '<UNK>']:
-                tokens.append(token)
+        """
+        Convert token IDs back to text using SentencePiece
         
-        return ' '.join(tokens)
+        Args:
+            token_ids: List of token IDs
+            
+        Returns:
+            Decoded text
+        """
+        return self.processor.decode_sentence(token_ids, skip_special_tokens=True)
     
     def translate(self, text: str, beam_size: int = 5, length_penalty: float = 0.6,
                   use_greedy: bool = False) -> str:
@@ -151,41 +127,147 @@ class Translator:
         return translation
     
     def translate_file(self, input_file: str, output_file: str,
-                       beam_size: int = 5, use_greedy: bool = False):
+                       beam_size: int = 5, use_greedy: bool = False,
+                       batch_size: int = 1, save_jsonl: bool = True):
         """
-        Translate a file line by line
+        Translate a file line by line with batching support
         
         Args:
             input_file: Input file path
-            output_file: Output file path
+            output_file: Output file path (will save both .vi and .jsonl)
             beam_size: Beam size
             use_greedy: Use greedy search
+            batch_size: Number of sentences to process at once
+            save_jsonl: Save results in JSONL format for incremental saving
         """
-        print(f"Translating {input_file}...")
+        print(f"\nTranslating {input_file}...")
+        print(f"Output will be saved to {output_file}")
+        print(f"Batch size: {batch_size}")
         
+        # Read all lines
         with open(input_file, 'r', encoding='utf-8') as f_in:
             lines = f_in.readlines()
         
-        translations = []
+        # Prepare output files
+        output_path = Path(output_file)
+        jsonl_path = output_path.parent / (output_path.stem + '.jsonl')
         
-        for i, line in enumerate(lines, 1):
-            line = line.strip()
-            if not line:
-                translations.append('')
-                continue
-            
-            translation = self.translate(line, beam_size, use_greedy=use_greedy)
-            translations.append(translation)
-            
-            if i % 100 == 0:
-                print(f"  Translated {i}/{len(lines)} lines")
+        # Open files for incremental saving
+        f_out = open(output_file, 'w', encoding='utf-8')
+        if save_jsonl:
+            f_jsonl = open(jsonl_path, 'w', encoding='utf-8')
         
-        # Save translations
-        with open(output_file, 'w', encoding='utf-8') as f_out:
-            for translation in translations:
-                f_out.write(translation + '\n')
+        total_lines = len(lines)
+        translated_count = 0
         
-        print(f"✓ Translations saved to {output_file}")
+        try:
+            # Process in batches
+            for batch_start in tqdm(range(0, total_lines, batch_size), desc="Translating"):
+                batch_end = min(batch_start + batch_size, total_lines)
+                batch_lines = lines[batch_start:batch_end]
+                
+                batch_src_tensors = []
+                batch_original = []
+                
+                # Prepare batch
+                for line in batch_lines:
+                    line = line.strip()
+                    batch_original.append(line)
+                    
+                    if not line:
+                        continue
+                    
+                    # Tokenize
+                    src_ids = self.tokenize(line)
+                    src_tensor = torch.tensor(src_ids, dtype=torch.long)
+                    batch_src_tensors.append(src_tensor)
+                
+                # Skip if all empty
+                if not batch_src_tensors:
+                    for _ in batch_lines:
+                        f_out.write('\n')
+                        if save_jsonl:
+                            f_jsonl.write(json.dumps({
+                                'id': translated_count,
+                                'source': '',
+                                'translation': ''
+                            }, ensure_ascii=False) + '\n')
+                        translated_count += 1
+                    continue
+                
+                # Pad batch to same length
+                max_len = max(len(t) for t in batch_src_tensors)
+                padded_batch = []
+                for t in batch_src_tensors:
+                    if len(t) < max_len:
+                        padding = torch.full((max_len - len(t),), self.processor.pad_idx, dtype=torch.long)
+                        t = torch.cat([t, padding])
+                    padded_batch.append(t)
+                
+                # Stack into batch tensor [batch_size, seq_len]
+                batch_tensor = torch.stack(padded_batch).to(self.config.device)
+                
+                # Translate batch
+                with torch.no_grad():
+                    if use_greedy:
+                        # Process one by one for greedy (model.translate_greedy expects single input)
+                        batch_translations = []
+                        for i in range(batch_tensor.size(0)):
+                            tgt_ids = self.model.translate_greedy(batch_tensor[i:i+1])
+                            translation = self.detokenize(tgt_ids)
+                            batch_translations.append(translation)
+                    else:
+                        # Process one by one for beam search (model.translate_beam expects single input)
+                        batch_translations = []
+                        for i in range(batch_tensor.size(0)):
+                            tgt_ids = self.model.translate_beam(
+                                batch_tensor[i:i+1],
+                                beam_size=beam_size,
+                                length_penalty=0.6
+                            )
+                            translation = self.detokenize(tgt_ids)
+                            batch_translations.append(translation)
+                
+                # Save results immediately
+                trans_idx = 0
+                for i, original in enumerate(batch_original):
+                    if not original:
+                        translation = ''
+                    else:
+                        translation = batch_translations[trans_idx]
+                        trans_idx += 1
+                    
+                    # Write to text file
+                    f_out.write(translation + '\n')
+                    f_out.flush()  # Flush to disk immediately
+                    
+                    # Write to JSONL
+                    if save_jsonl:
+                        f_jsonl.write(json.dumps({
+                            'id': translated_count,
+                            'source': original,
+                            'translation': translation
+                        }, ensure_ascii=False) + '\n')
+                        f_jsonl.flush()  # Flush to disk immediately
+                    
+                    # Print sample
+                    if translated_count < 5 or (translated_count + 1) % 100 == 0:
+                        print(f"\n[{translated_count + 1}] EN: {original[:100]}...")
+                        print(f"    VI: {translation[:100]}...")
+                    
+                    translated_count += 1
+        
+        finally:
+            # Close files
+            f_out.close()
+            if save_jsonl:
+                f_jsonl.close()
+        
+        print(f"\n✓ Translated {translated_count} lines")
+        print(f"✓ Translations saved to:")
+        print(f"  - Text: {output_file}")
+        if save_jsonl:
+            print(f"  - JSONL: {jsonl_path}")
 
 
 def main():
@@ -195,12 +277,12 @@ def main():
     PROJECT_ROOT = Path(__file__).resolve().parent.parent
     
     # Configuration (relative to project root)
-    CHECKPOINT_PATH = PROJECT_ROOT / "checkpoints" / "best_model" / "best_model.pt"
-    VOCAB_PATH = PROJECT_ROOT / "SentencePiece-from-scratch" / "tokenizer_models" / "vocabulary.txt"
+    CHECKPOINT_PATH = PROJECT_ROOT / "checkpoints" / "best_model_en2vi" / "best_model.pt"
+    TOKENIZER_DIR = PROJECT_ROOT / "SentencePiece-from-scratch" / "tokenizer_models"
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     # Create translator
-    translator = Translator(CHECKPOINT_PATH, VOCAB_PATH, DEVICE)
+    translator = Translator(str(CHECKPOINT_PATH), str(TOKENIZER_DIR), DEVICE)
     
     print("\n" + "=" * 60)
     print("English-Vietnamese Translator (EN → VI)")

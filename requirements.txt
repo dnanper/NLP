@@ -1,5 +1,7 @@
+python-dotenv>=1.0.0
 torch>=2.0.0
-numpy>=1.24.0
+transformers>=4.30.0
+accelerate
 scipy>=1.10.0
 sacrebleu>=2.3.0
 tqdm>=4.65.0
@@ -8,6 +10,5 @@ seaborn>=0.12.0
 pandas>=2.0.0
 datasets>=2.14.0
 nltk>=3.8.0
-google-generativeai>=0.3.0
 jupyter>=1.0.0
 tensorboard>=2.13.0

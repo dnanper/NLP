@@ -1,12 +1,17 @@
 """
 Configuration file for Vietnamese-English Neural Machine Translation
 """
+import os
+from pathlib import Path
+
+# Get the absolute path of the project root directory
+PROJECT_ROOT = Path(__file__).parent.absolute()
 
 class Config:
     # Data settings
-    DATA_DIR = "./data"
-    RAW_DATA_DIR = "./data/raw"
-    PROCESSED_DATA_DIR = "./data/processed"
+    DATA_DIR = str(PROJECT_ROOT / "data")
+    RAW_DATA_DIR = str(PROJECT_ROOT / "data" / "raw")
+    PROCESSED_DATA_DIR = str(PROJECT_ROOT / "data" / "processed")
     DATASET_NAME = "ura-hcmut/PhoMT"  # PhoMT dataset with ~2.9M parallel sentences
     
     # Model hyperparameters
@@ -47,7 +52,7 @@ class Config:
     UNK_TOKEN = "<unk>"
     
     # Checkpoint settings
-    CHECKPOINT_DIR = "./checkpoints"
+    CHECKPOINT_DIR = str(PROJECT_ROOT / "checkpoints")
     SAVE_EVERY = 1             # Save checkpoint every N epochs
     
     # Evaluation settings

@@ -18,85 +18,62 @@ from pathlib import Path
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+# Add BLEU directory to path
+BLEU_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'BLEU')
+sys.path.insert(0, BLEU_DIR)
+
 from models_best import BestTransformer, TransformerConfig
 from utils.data_processing import DataProcessor, collate_fn
 from config import Config
 
+# Import BLEU score calculator
+from bleu_score import cal_corpus_bleu_score
 
-def compute_bleu(references: List[List[int]], hypotheses: List[List[int]], 
-                 max_n: int = 4) -> Dict[str, float]:
+
+def compute_bleu_with_tokens(references: List[List[int]], hypotheses: List[List[int]], 
+                              processor: DataProcessor, max_n: int = 4) -> Dict[str, float]:
     """
-    Compute BLEU score
+    Compute BLEU score using the BLEU library
     
     Args:
         references: List of reference token sequences
         hypotheses: List of hypothesis token sequences
-        max_n: Maximum n-gram order
+        processor: DataProcessor for decoding tokens to text
+        max_n: Maximum n-gram order (default 4 for BLEU-4)
     
     Returns:
         Dictionary with BLEU scores
     """
-    assert len(references) == len(hypotheses)
+    assert len(references) == len(hypotheses), "References and hypotheses must have same length"
     
-    total_count = [0] * max_n
-    clip_count = [0] * max_n
-    ref_length = 0
-    hyp_length = 0
+    # Convert token IDs to text
+    reference_texts = []
+    hypothesis_texts = []
     
-    for ref, hyp in zip(references, hypotheses):
-        ref_length += len(ref)
-        hyp_length += len(hyp)
+    for ref_tokens, hyp_tokens in zip(references, hypotheses):
+        # Decode to text
+        ref_text = processor.decode_sentence(ref_tokens, skip_special_tokens=True)
+        hyp_text = processor.decode_sentence(hyp_tokens, skip_special_tokens=True)
         
-        # Count n-grams
-        for n in range(1, max_n + 1):
-            # Reference n-grams
-            ref_ngrams = Counter([tuple(ref[i:i+n]) for i in range(len(ref) - n + 1)])
-            
-            # Hypothesis n-grams
-            hyp_ngrams = Counter([tuple(hyp[i:i+n]) for i in range(len(hyp) - n + 1)])
-            
-            # Clip count
-            for ngram, count in hyp_ngrams.items():
-                clip_count[n-1] += min(count, ref_ngrams.get(ngram, 0))
-            
-            # Total count
-            total_count[n-1] += max(len(hyp) - n + 1, 0)
+        reference_texts.append(ref_text)
+        hypothesis_texts.append(hyp_text)
     
-    # Compute precision for each n-gram
-    precisions = []
-    for i in range(max_n):
-        if total_count[i] > 0:
-            p = clip_count[i] / total_count[i]
-            precisions.append(p)
-        else:
-            precisions.append(0.0)
+    # Convert to format expected by BLEU library (list of list of references)
+    references_list = [[ref] for ref in reference_texts]
     
-    # Brevity penalty
-    if hyp_length > ref_length:
-        bp = 1.0
-    else:
-        bp = math.exp(1 - ref_length / hyp_length) if hyp_length > 0 else 0.0
-    
-    # Compute BLEU for each n-gram order
+    # Calculate BLEU scores for different n-grams
     results = {}
-    for n in range(1, max_n + 1):
-        if min(precisions[:n]) > 0:
-            log_precisions = sum(math.log(p) for p in precisions[:n]) / n
-            bleu_n = bp * math.exp(log_precisions)
-        else:
-            bleu_n = 0.0
-        results[f'bleu-{n}'] = bleu_n * 100
+    weights_dict = {
+        1: [1.0],
+        2: [0.5, 0.5],
+        3: [1/3, 1/3, 1/3],
+        4: [0.25, 0.25, 0.25, 0.25]
+    }
     
-    # Add other metrics
-    results.update({
-        'bp': bp,
-        'precision_1': precisions[0] * 100,
-        'precision_2': precisions[1] * 100,
-        'precision_3': precisions[2] * 100,
-        'precision_4': precisions[3] * 100,
-        'ref_length': ref_length,
-        'hyp_length': hyp_length,
-    })
+    for n in range(1, max_n + 1):
+        weights = weights_dict[n]
+        bleu_n = cal_corpus_bleu_score(hypothesis_texts, references_list, N=n, weights=weights)
+        results[f'bleu-{n}'] = bleu_n * 100  # Convert to percentage
     
     return results
 
@@ -106,14 +83,16 @@ class Evaluator:
     Evaluate translation model
     """
     
-    def __init__(self, model: BestTransformer, test_loader: DataLoader):
+    def __init__(self, model: BestTransformer, test_loader: DataLoader, processor: DataProcessor):
         """
         Args:
             model: Trained model
             test_loader: Test dataloader
+            processor: DataProcessor for decoding
         """
         self.model = model
         self.test_loader = test_loader
+        self.processor = processor
         self.device = model.device
     
     @torch.no_grad()
@@ -178,8 +157,9 @@ class Evaluator:
         
         eval_time = time.time() - start_time
         
-        # Compute BLEU
-        bleu_results = compute_bleu(references, hypotheses)
+        # Compute BLEU using the BLEU library
+        print("\nComputing BLEU scores...")
+        bleu_results = compute_bleu_with_tokens(references, hypotheses, self.processor)
         
         # Add timing info
         bleu_results['eval_time'] = eval_time
@@ -193,9 +173,6 @@ class Evaluator:
         print(f"BLEU-2:            {bleu_results['bleu-2']:.2f}")
         print(f"BLEU-3:            {bleu_results['bleu-3']:.2f}")
         print(f"BLEU-4:            {bleu_results['bleu-4']:.2f}")
-        print(f"Brevity Penalty:   {bleu_results['bp']:.4f}")
-        print(f"Ref length:        {bleu_results['ref_length']:,}")
-        print(f"Hyp length:        {bleu_results['hyp_length']:,}")
         print(f"Eval time:         {eval_time:.1f}s")
         print(f"Speed:             {bleu_results['sentences_per_sec']:.1f} sent/s")
         print("=" * 60)
@@ -269,7 +246,7 @@ def main():
     
     # Load checkpoint
     print(f"\nLoading checkpoint: {CHECKPOINT_PATH}")
-    checkpoint = torch.load(CHECKPOINT_PATH, map_location='cpu')
+    checkpoint = torch.load(CHECKPOINT_PATH, map_location='cpu', weights_only=False)
     config = checkpoint['config']
     config.device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
@@ -314,8 +291,8 @@ def main():
     print(f"  Model loaded to {config.device}")
     print(f"  Parameters: {model.count_parameters():,}")
     
-    # Create evaluator
-    evaluator = Evaluator(model, test_loader)
+    # Create evaluator with processor
+    evaluator = Evaluator(model, test_loader, processor)
     
     # Show examples
     evaluator.show_examples(processor, num_examples=5)
