@@ -68,14 +68,22 @@ class LabelSmoothingLoss(nn.Module):
         
         # Create smoothed target distribution
         with torch.no_grad():
-            # Start with uniform distribution with smoothing value
-            smooth_targets = torch.full_like(log_probs, self.smoothing_value)
+            # CORRECT IMPLEMENTATION: Only operate on non-PAD positions
+            smooth_targets = torch.zeros_like(log_probs)
             
-            # Set correct class to confidence
-            smooth_targets.scatter_(1, targets.unsqueeze(1), self.confidence)
+            # Create mask for valid (non-padding) tokens
+            non_pad = targets != self.ignore_index
             
-            # Zero out padding tokens
-            smooth_targets = smooth_targets * mask.unsqueeze(1).float()
+            # Distribute smoothing over ALL classes (only for non-PAD rows)
+            smooth_targets[non_pad] = self.smoothing / (self.num_classes - 1)
+            
+            # Set correct class to confidence (only for non-PAD rows)
+            # This NEVER touches PAD rows - they remain all zeros
+            smooth_targets[non_pad].scatter_(
+                1,
+                targets[non_pad].unsqueeze(1),
+                self.confidence
+            )
         
         # Compute KL divergence
         loss = -torch.sum(smooth_targets * log_probs, dim=-1)

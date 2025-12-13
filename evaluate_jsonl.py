@@ -1,18 +1,13 @@
 """
 Evaluate translation results from JSONL file
-Compare predictions with ground truth using BLEU score
+Compare predictions with ground truth using sacreBleu
 """
 
 import json
 import sys
 import os
 from pathlib import Path
-
-# Add BLEU directory to path
-BLEU_DIR = os.path.join(os.path.dirname(__file__), 'BLEU')
-sys.path.insert(0, BLEU_DIR)
-
-from bleu_score import cal_corpus_bleu_score
+from sacrebleu import corpus_bleu, BLEU
 
 
 def load_jsonl(jsonl_path):
@@ -39,7 +34,7 @@ def load_references(ref_path):
 
 def evaluate_bleu(predictions, references):
     """
-    Calculate BLEU scores
+    Calculate BLEU scores using sacreBleu
     
     Args:
         predictions: List of predicted translations (strings)
@@ -51,48 +46,39 @@ def evaluate_bleu(predictions, references):
     assert len(predictions) == len(references), \
         f"Predictions ({len(predictions)}) and references ({len(references)}) must have same length"
     
-    # Calculate BLEU scores for different n-grams
     results = {}
-    weights_dict = {
-        1: [1.0],
-        2: [0.5, 0.5],
-        3: [1/3, 1/3, 1/3],
-        4: [0.25, 0.25, 0.25, 0.25]
-    }
     
-    print("\nCalculating BLEU scores...")
+    print("\nCalculating sacreBleu scores...")
+    print(f"Total examples: {len(predictions)}")
+    
+    # sacreBleu expects references as list of lists (for multiple references per example)
+    # We have one reference per example
+    refs = [references]  # Wrap in list for sacreBleu format
+    
+    # Calculate BLEU-4 (default) with different max_ngram_order
     for n in range(1, 5):
-        weights = weights_dict[n]
-        
-        # Filter out pairs where either prediction or reference is too short for n-grams
-        filtered_preds = []
-        filtered_refs = []
-        
-        for pred, ref in zip(predictions, references):
-            pred_tokens = pred.split()
-            ref_tokens = ref.split()
-            
-            # Need at least n tokens for n-grams
-            if len(pred_tokens) >= n and len(ref_tokens) >= n:
-                filtered_preds.append(pred)
-                filtered_refs.append(ref)
-        
-        if len(filtered_preds) == 0:
-            print(f"  BLEU-{n}: N/A (no sentences with >= {n} tokens)")
-            results[f'bleu-{n}'] = 0.0
-            continue
-        
-        # Create fresh references_list
-        references_list = [[ref] for ref in filtered_refs]
-        
-        # Calculate BLEU
         try:
-            bleu_n = cal_corpus_bleu_score(filtered_preds, references_list, N=n, weights=weights)
-            results[f'bleu-{n}'] = bleu_n * 100  # Convert to percentage
-            print(f"  BLEU-{n}: {results[f'bleu-{n}']:.2f}% ({len(filtered_preds)}/{len(predictions)} sentences)")
+            bleu = corpus_bleu(
+                predictions, 
+                refs,
+                max_ngram_order=n,
+                smooth_method='exp',  # Exponential smoothing (recommended)
+                smooth_value=None,
+                force=False,
+                lowercase=False,
+                tokenize='13a',  # Standard tokenization for international text
+                use_effective_order=False
+            )
+            
+            results[f'bleu-{n}'] = bleu.score
+            print(f"  BLEU-{n}: {bleu.score:.2f}")
         except Exception as e:
             print(f"  BLEU-{n}: Error - {e}")
             results[f'bleu-{n}'] = 0.0
+    
+    # Show signature for reproducibility
+    bleu_4 = corpus_bleu(predictions, refs, tokenize='13a')
+    print(f"\nsacreBleu signature: {bleu_4.format()}")
     
     return results
 

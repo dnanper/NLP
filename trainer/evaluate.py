@@ -1,7 +1,7 @@
 """
 Evaluation Script for Translation Quality
 
-Compute BLEU score and other metrics
+Compute BLEU score and other metrics using sacreBleu
 """
 
 import torch
@@ -14,26 +14,20 @@ import math
 import sys
 import os
 from pathlib import Path
+from sacrebleu import corpus_bleu
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-
-# Add BLEU directory to path
-BLEU_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'BLEU')
-sys.path.insert(0, BLEU_DIR)
 
 from models_best import BestTransformer, TransformerConfig
 from utils.data_processing import DataProcessor, collate_fn
 from config import Config
 
-# Import BLEU score calculator
-from bleu_score import cal_corpus_bleu_score
-
 
 def compute_bleu_with_tokens(references: List[List[int]], hypotheses: List[List[int]], 
                               processor: DataProcessor, max_n: int = 4) -> Dict[str, float]:
     """
-    Compute BLEU score using the BLEU library
+    Compute BLEU score using sacreBleu
     
     Args:
         references: List of reference token sequences
@@ -58,22 +52,22 @@ def compute_bleu_with_tokens(references: List[List[int]], hypotheses: List[List[
         reference_texts.append(ref_text)
         hypothesis_texts.append(hyp_text)
     
-    # Convert to format expected by BLEU library (list of list of references)
-    references_list = [[ref] for ref in reference_texts]
+    # sacreBleu expects references as list of lists (for multiple references per example)
+    refs = [reference_texts]  # Wrap in list for sacreBleu format
     
-    # Calculate BLEU scores for different n-grams
+    # Calculate BLEU scores for different n-grams using sacreBleu
     results = {}
-    weights_dict = {
-        1: [1.0],
-        2: [0.5, 0.5],
-        3: [1/3, 1/3, 1/3],
-        4: [0.25, 0.25, 0.25, 0.25]
-    }
     
     for n in range(1, max_n + 1):
-        weights = weights_dict[n]
-        bleu_n = cal_corpus_bleu_score(hypothesis_texts, references_list, N=n, weights=weights)
-        results[f'bleu-{n}'] = bleu_n * 100  # Convert to percentage
+        bleu = corpus_bleu(
+            hypothesis_texts, 
+            refs,
+            max_ngram_order=n,
+            smooth_method='exp',
+            lowercase=False,
+            tokenize='13a'  # Standard international tokenization
+        )
+        results[f'bleu-{n}'] = bleu.score
     
     return results
 

@@ -59,14 +59,27 @@ class Trainer:
             ignore_index=config.pad_idx
         )
         
-        # Optimizer
-        self.optimizer = torch.optim.Adam(
-            model.parameters(),
-            lr=config.learning_rate,
-            betas=(config.beta1, config.beta2),
-            eps=config.eps,
-            weight_decay=config.weight_decay
-        )
+        # Optimizer - Use AdamW (better weight decay than Adam)
+        # Try fused version for 30-50% faster training if available
+        try:
+            self.optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=config.learning_rate,
+                betas=(config.beta1, config.beta2),
+                eps=config.eps,
+                weight_decay=config.weight_decay,
+                fused=True  # PyTorch 2.0+ - faster CUDA kernel
+            )
+            print("✓ Using fused AdamW optimizer (faster)")
+        except:
+            self.optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=config.learning_rate,
+                betas=(config.beta1, config.beta2),
+                eps=config.eps,
+                weight_decay=config.weight_decay
+            )
+            print("✓ Using standard AdamW optimizer")
         
         # Learning rate scheduler with warmup
         self.scheduler = self._create_scheduler()
@@ -80,71 +93,132 @@ class Trainer:
         self.history = {
             'train_loss': [],
             'val_loss': [],
-            'learning_rate': []
+            'learning_rate': [],
+            'bleu_scores': []  # Track BLEU each epoch
         }
+        
+        # Gradient accumulation
+        self.gradient_accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
     
     def _create_scheduler(self):
-        """Create learning rate scheduler with warmup"""
+        """Create learning rate scheduler: Warmup + Hold + Cosine Decay
+        
+        Strategy for large dataset (2.4M samples):
+        1. Warmup: 0 → peak LR (fast initial learning)
+        2. Hold: Keep peak LR (allow model to optimize properly)
+        3. Decay: Slow cosine decay (fine-tuning)
+        
+        NOTE: With gradient accumulation, optimizer steps = batches / accumulation_steps
+        """
+        import math
+        
+        # Calculate actual optimizer steps (NOT batch steps)
+        batches_per_epoch = len(self.train_loader)
+        optimizer_steps_per_epoch = batches_per_epoch // self.gradient_accumulation_steps
+        total_optimizer_steps = optimizer_steps_per_epoch * 15  # 15 epochs total
+        
+        # Phase 1: Warmup (0 → peak)
+        warmup_steps = self.config.warmup_steps
+        
+        # Phase 2: Hold at peak LR (CRITICAL for large dataset!)
+        # Keep peak LR for 5 epochs to allow proper optimization
+        hold_steps = optimizer_steps_per_epoch * 5  # Hold for 5 epochs
+        
+        # Phase 3: Cosine decay
+        decay_start = warmup_steps + hold_steps
+        
         def lr_lambda(step):
-            if step < self.config.warmup_steps:
-                # Linear warmup
-                return step / self.config.warmup_steps
+            if step < warmup_steps:
+                # Phase 1: Linear warmup
+                return step / warmup_steps
+            
+            elif step < decay_start:
+                # Phase 2: HOLD at peak LR (return 1.0)
+                return 1.0
+            
             else:
-                # Inverse square root decay
-                return (self.config.warmup_steps / step) ** 0.5
+                # Phase 3: Cosine decay
+                progress = (step - decay_start) / (total_optimizer_steps - decay_start)
+                progress = min(1.0, progress)
+                cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+                min_lr_ratio = 0.1
+                return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
+        
+        print(f"\nScheduler Info (with gradient_accumulation_steps={self.gradient_accumulation_steps}):")
+        print(f"  Batches/epoch: {batches_per_epoch:,}")
+        print(f"  Optimizer steps/epoch: {optimizer_steps_per_epoch:,}")
+        print(f"  Warmup: {warmup_steps:,} steps ({warmup_steps/optimizer_steps_per_epoch:.2f} epochs)")
+        print(f"  Hold: {hold_steps:,} steps (5 epochs)")
+        print(f"  Cosine decay: {total_optimizer_steps - decay_start:,} steps (~9 epochs)")
         
         return torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
     
     def train_epoch(self) -> float:
-        """Train one epoch"""
+        """Train one epoch with gradient accumulation support"""
         self.model.train()
         total_loss = 0
         num_batches = len(self.train_loader)
         
         pbar = tqdm(self.train_loader, desc=f"Epoch {self.epoch}")
         
+        # Initialize gradient accumulation
+        self.optimizer.zero_grad()
+        
         for batch_idx, batch in enumerate(pbar):
             # Move to device
-            src = batch['src'].to(self.config.device)  # [batch_size, src_len]
-            tgt = batch['tgt'].to(self.config.device)  # [batch_size, tgt_len]
-            src_mask = batch['src_mask'].to(self.config.device)  # [batch_size, 1, 1, src_len]
-            tgt_mask = batch['tgt_mask'].to(self.config.device)  # [batch_size, 1, tgt_len, tgt_len]
+            src = batch['src'].to(self.config.device)
+            tgt = batch['tgt'].to(self.config.device)
+            src_mask = batch['src_mask'].to(self.config.device)
+            tgt_mask = batch['tgt_mask'].to(self.config.device)
             
             # Prepare input and output
-            tgt_input = tgt[:, :-1]   # Remove last token (for input)
-            tgt_output = tgt[:, 1:]   # Remove first token (for output)
-            tgt_mask = tgt_mask[:, :, :-1, :-1]  # Adjust mask for tgt_input
+            tgt_input = tgt[:, :-1]
+            tgt_output = tgt[:, 1:]
+            tgt_mask = tgt_mask[:, :, :-1, :-1]
             
             # Forward pass
-            logits = self.model(src, tgt_input, src_mask, tgt_mask)  # [batch_size, tgt_len-1, vocab_size]
+            logits = self.model(src, tgt_input, src_mask, tgt_mask)
             
-            # Compute loss
-            loss = self.criterion(logits, tgt_output)
+            # Compute loss (scale by accumulation steps)
+            loss = self.criterion(logits, tgt_output) / self.gradient_accumulation_steps
             
             # Backward pass
-            self.optimizer.zero_grad()
             loss.backward()
             
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+            # Update weights only every N steps
+            if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
+                # Gradient clipping with monitoring
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), 
+                    self.config.grad_clip
+                )
+                
+                # Track gradient norms
+                if not hasattr(self, 'grad_norms'):
+                    self.grad_norms = []
+                if self.global_step % 100 == 0:
+                    self.grad_norms.append(grad_norm.item())
+                
+                # Update weights
+                self.optimizer.step()
+                self.scheduler.step()
+                self.optimizer.zero_grad()
+                
+                self.global_step += 1
+                
+                # Log every 100 steps
+                if self.global_step % 100 == 0:
+                    self.history['learning_rate'].append(self.scheduler.get_last_lr()[0])
             
-            # Update weights
-            self.optimizer.step()
-            self.scheduler.step()
-            
-            # Track metrics
-            total_loss += loss.item()
-            self.global_step += 1
+            # Track metrics (unscaled loss for display)
+            total_loss += loss.item() * self.gradient_accumulation_steps
             
             # Update progress bar
             pbar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'lr': f'{self.scheduler.get_last_lr()[0]:.6f}'
+                'loss': f'{loss.item() * self.gradient_accumulation_steps:.4f}',
+                'lr': f'{self.scheduler.get_last_lr()[0]:.6f}',
+                'accum': f'{(batch_idx + 1) % self.gradient_accumulation_steps}/{self.gradient_accumulation_steps}'
             })
-            
-            # Log every 100 steps
-            if self.global_step % 100 == 0:
-                self.history['learning_rate'].append(self.scheduler.get_last_lr()[0])
         
         avg_loss = total_loss / num_batches
         return avg_loss
@@ -179,6 +253,77 @@ class Trainer:
         
         avg_loss = total_loss / num_batches
         return avg_loss
+    
+    @torch.no_grad()
+    def compute_bleu(self, num_samples: int = 500) -> float:
+        """
+        Compute BLEU score on validation set
+        
+        Args:
+            num_samples: Number of samples to evaluate (default 500 for speed)
+        
+        Returns:
+            BLEU-4 score
+        """
+        from evaluate import compute_bleu_with_tokens
+        
+        self.model.eval()
+        references = []
+        hypotheses = []
+        
+        print(f"\nComputing BLEU on {num_samples} validation samples...")
+        
+        for i, batch in enumerate(self.val_loader):
+            if i * batch['src'].size(0) >= num_samples:
+                break
+            
+            src = batch['src'].to(self.config.device)
+            tgt = batch['tgt'].to(self.config.device)
+            src_mask = batch['src_mask'].to(self.config.device)
+            
+            # Greedy decode
+            batch_size = src.size(0)
+            max_len = self.config.max_decode_length
+            
+            # Start with SOS token
+            decoder_input = torch.full((batch_size, 1), self.config.bos_idx, 
+                                     dtype=torch.long, device=self.config.device)
+            
+            for _ in range(max_len):
+                # Create causal mask for decoder
+                tgt_len = decoder_input.size(1)
+                tgt_mask = torch.tril(torch.ones((tgt_len, tgt_len), device=self.config.device))
+                tgt_mask = tgt_mask.unsqueeze(0).unsqueeze(0).bool()
+                
+                # Forward pass
+                logits = self.model(src, decoder_input, src_mask, tgt_mask)
+                
+                # Get next token
+                next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                decoder_input = torch.cat([decoder_input, next_token], dim=1)
+                
+                # Stop if all sequences have EOS
+                if (next_token == self.config.eos_idx).all():
+                    break
+            
+            # Collect references and hypotheses
+            for j in range(batch_size):
+                ref = tgt[j].cpu().tolist()
+                hyp = decoder_input[j].cpu().tolist()
+                
+                references.append(ref)
+                hypotheses.append(hyp)
+        
+        # Compute BLEU using evaluate module
+        # Need processor for decoding
+        from utils.data_processing import DataProcessor
+        processor = DataProcessor(self.config)
+        
+        results = compute_bleu_with_tokens(references, hypotheses, processor, max_n=4)
+        bleu_4 = results.get('bleu-4', 0.0)
+        
+        print(f"✓ BLEU-4: {bleu_4:.2f}")
+        return bleu_4
     
     def save_checkpoint(self, filename: str = 'checkpoint.pt'):
         """Save model checkpoint"""
@@ -249,15 +394,31 @@ class Trainer:
             self.history['train_loss'].append(train_loss)
             self.history['val_loss'].append(val_loss)
             
+            # Compute BLEU every epoch (or every N epochs for speed)
+            if self.epoch % 2 == 0:  # Change to 2 or 5 if too slow
+                bleu_score = self.compute_bleu(num_samples=200)
+                self.history['bleu_scores'].append(bleu_score)
+            else:
+                self.history['bleu_scores'].append(None)
+            
             # Compute epoch time
             epoch_time = time.time() - epoch_start_time
+            
+            # Average gradient norm
+            if hasattr(self, 'grad_norms') and len(self.grad_norms) > 0:
+                avg_grad_norm = sum(self.grad_norms[-10:]) / min(10, len(self.grad_norms))
+            else:
+                avg_grad_norm = 0
             
             # Print summary
             print(f"\n{'='*60}")
             print(f"Epoch {self.epoch} Summary:")
             print(f"  Train Loss: {train_loss:.4f}")
             print(f"  Val Loss:   {val_loss:.4f}")
+            if self.history['bleu_scores'][-1] is not None:
+                print(f"  BLEU-4:     {self.history['bleu_scores'][-1]:.2f}")
             print(f"  LR:         {self.scheduler.get_last_lr()[0]:.6f}")
+            print(f"  Avg Grad:   {avg_grad_norm:.2f}")
             print(f"  Time:       {epoch_time:.1f}s")
             print(f"{'='*60}\n")
             
@@ -288,28 +449,56 @@ class Trainer:
     
     def plot_training_curves(self):
         """Plot and save training curves"""
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        
+        epochs = range(1, len(self.history['train_loss']) + 1)
         
         # Loss curves
-        epochs = range(1, len(self.history['train_loss']) + 1)
-        ax1.plot(epochs, self.history['train_loss'], label='Train Loss', marker='o')
-        ax1.plot(epochs, self.history['val_loss'], label='Val Loss', marker='s')
-        ax1.set_xlabel('Epoch')
-        ax1.set_ylabel('Loss')
-        ax1.set_title('Training and Validation Loss')
-        ax1.legend()
-        ax1.grid(True)
+        ax1 = axes[0, 0]
+        ax1.plot(epochs, self.history['train_loss'], label='Train Loss', marker='o', linewidth=2)
+        ax1.plot(epochs, self.history['val_loss'], label='Val Loss', marker='s', linewidth=2)
+        ax1.set_xlabel('Epoch', fontsize=12)
+        ax1.set_ylabel('Loss', fontsize=12)
+        ax1.set_title('Training and Validation Loss', fontsize=14, fontweight='bold')
+        ax1.legend(fontsize=10)
+        ax1.grid(True, alpha=0.3)
+        
+        # BLEU scores
+        ax2 = axes[0, 1]
+        bleu_epochs = [i for i, score in enumerate(self.history['bleu_scores'], 1) if score is not None]
+        bleu_values = [score for score in self.history['bleu_scores'] if score is not None]
+        if bleu_values:
+            ax2.plot(bleu_epochs, bleu_values, label='BLEU-4', marker='D', 
+                    color='green', linewidth=2, markersize=8)
+            ax2.set_xlabel('Epoch', fontsize=12)
+            ax2.set_ylabel('BLEU-4 Score', fontsize=12)
+            ax2.set_title('BLEU Score Progress', fontsize=14, fontweight='bold')
+            ax2.legend(fontsize=10)
+            ax2.grid(True, alpha=0.3)
         
         # Learning rate
+        ax3 = axes[1, 0]
         steps = range(len(self.history['learning_rate']))
-        ax2.plot(steps, self.history['learning_rate'])
-        ax2.set_xlabel('Step (x100)')
-        ax2.set_ylabel('Learning Rate')
-        ax2.set_title('Learning Rate Schedule')
-        ax2.grid(True)
+        ax3.plot(steps, self.history['learning_rate'], color='orange', linewidth=2)
+        ax3.set_xlabel('Step (x100)', fontsize=12)
+        ax3.set_ylabel('Learning Rate', fontsize=12)
+        ax3.set_title('Learning Rate Schedule', fontsize=14, fontweight='bold')
+        ax3.grid(True, alpha=0.3)
+        
+        # Gradient norms
+        ax4 = axes[1, 1]
+        if hasattr(self, 'grad_norms') and len(self.grad_norms) > 0:
+            ax4.plot(self.grad_norms, color='red', linewidth=1.5, alpha=0.7)
+            ax4.axhline(y=self.config.grad_clip, color='black', linestyle='--', 
+                       label=f'Clip threshold ({self.config.grad_clip})')
+            ax4.set_xlabel('Step (x100)', fontsize=12)
+            ax4.set_ylabel('Gradient Norm', fontsize=12)
+            ax4.set_title('Gradient Norms', fontsize=14, fontweight='bold')
+            ax4.legend(fontsize=10)
+            ax4.grid(True, alpha=0.3)
         
         plt.tight_layout()
-        plt.savefig(self.save_dir / 'training_curves.png', dpi=150)
+        plt.savefig(self.save_dir / 'training_curves.png', dpi=150, bbox_inches='tight')
         print(f"✓ Training curves saved to {self.save_dir / 'training_curves.png'}")
 
 
@@ -333,15 +522,25 @@ def main():
     config = TransformerConfig.base()
     config.device = 'cuda' if torch.cuda.is_available() else 'cpu'
     config.max_len = Config.MAX_LEN
-    config.dropout = 0.1
-    config.label_smoothing = 0.1
-    config.warmup_steps = 8000
-    config.learning_rate = 1e-4
-    config.grad_clip = 1.0
+    
+    # CRITICAL: Higher regularization for large dataset (2.4M samples)
+    config.dropout = 0.1              # Increased from 0.1 to reduce overfitting
+    config.attention_dropout = 0.1    # Add attention dropout
+    config.label_smoothing = 0.05
+    
+    # CRITICAL: Warmup + HOLD + Decay strategy
+    config.warmup_steps = 10000       # Fast warmup (~25% of epoch 1 with batch 64)
+    config.learning_rate = 1.5e-4     # Moderate LR, will hold at peak for 10 epochs
+    config.grad_clip = 5.0            # Increased from 1.0 - allow larger gradients
+    
+    # Gradient Accumulation (simulates larger batch size)
+    # Effective batch = BATCH_SIZE * gradient_accumulation_steps
+    # Example: 64 * 2 = 128 effective batch size
+    config.gradient_accumulation_steps = 2  # Set to 2, 4, or 8 if OOM
     
     # Training configuration
-    BATCH_SIZE = Config.BATCH_SIZE  # Adjust based on GPU memory
-    NUM_EPOCHS = 30
+    BATCH_SIZE = 32  # Base batch size
+    NUM_EPOCHS = 15  # Reduced from 30 for faster training
     
     print("=" * 60)
     print("English-Vietnamese Translation Training")
