@@ -12,7 +12,7 @@ from pathlib import Path
 # Add parent to path
 sys.path.insert(0, os.path.dirname(__file__))
 
-from models_best import BestTransformer, TransformerConfig
+from models_best_old import BestTransformer, TransformerConfig
 from utils.data_processing import DataProcessor, collate_fn
 from config import Config
 
@@ -179,7 +179,7 @@ def test_training_step():
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     
     # Create loss
-    from models_best import LabelSmoothingLoss
+    from models_best_old import LabelSmoothingLoss
     criterion = LabelSmoothingLoss(
         num_classes=vocab_size,
         smoothing=0.1,

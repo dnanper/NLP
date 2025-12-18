@@ -126,7 +126,7 @@ class Trainer:
         
         def lr_lambda(step):        
             if step < warmup_steps:
-                # Phase 1: Linear warmup
+                # Phase 1: Linear warmup 
                 return step / warmup_steps
             
             elif step < decay_start:
@@ -397,9 +397,8 @@ class Trainer:
             self.history['train_loss'].append(train_loss)
             self.history['val_loss'].append(val_loss)
             
-            # Compute BLEU every epoch (or every N epochs for speed)
-            # Disabled for faster training - enable after training stabilizes
-            if False and self.epoch % 5 == 0:  # Disabled
+            # Compute BLEU every 2 epochs (change to 1 for every epoch, or 5 for every 5 epochs)
+            if self.epoch % 2 == 0:
                 bleu_score = self.compute_bleu(num_samples=200)
                 self.history['bleu_scores'].append(bleu_score)
             else:

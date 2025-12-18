@@ -56,7 +56,7 @@ def main():
         output_file=str(OUTPUT_FILE),
         beam_size=1,
         use_greedy=True,
-        batch_size=32,
+        batch_size=256,
         save_jsonl=True  # Save JSONL for incremental results
     )
     

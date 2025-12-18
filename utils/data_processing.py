@@ -17,6 +17,8 @@ from torch.nn.utils.rnn import pad_sequence
 from datasets import load_dataset
 from tqdm import tqdm
 
+# Add parent directory to path for config import
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from config import Config
 
 # Add SentencePiece-from-scratch to path
@@ -135,14 +137,18 @@ class DataProcessor:
         processed_data = {
             'train': {'en': [], 'vi': []},
             'validation': {'en': [], 'vi': []},
-            'test': {'en': [], 'vi': []}
+            'test': {'en': [], 'vi': []},
+            'private_test': {'en': [], 'vi': []}
         }
         
-        # PhoMT has 'train' and 'validation' splits
-        # We'll split validation into dev and test
-        for split in ['train', 'validation']:
+        # PhoMT has 'train', 'validation', and 'test' splits
+        # We'll split validation into dev and test, and keep original test as private_test
+        for split in ['train', 'validation', 'test']:
             print(f"\nProcessing {split} split...")
             split_data = dataset[split]
+            
+            # Map 'test' split to 'private_test' in our processed data
+            target_split = 'private_test' if split == 'test' else split
             
             for example in tqdm(split_data):
                 # PhoMT format: {'en': '...', 'vi': '...'}
@@ -157,8 +163,8 @@ class DataProcessor:
                 
                 # Filter bad pairs
                 if self.filter_pair(en_text, vi_text):
-                    processed_data[split]['en'].append(en_text)
-                    processed_data[split]['vi'].append(vi_text)
+                    processed_data[target_split]['en'].append(en_text)
+                    processed_data[target_split]['vi'].append(vi_text)
         
         # Split validation into dev (50%) and test (50%)
         val_en = processed_data['validation']['en']
@@ -178,19 +184,21 @@ class DataProcessor:
         processed_dir = Path(Config.PROCESSED_DATA_DIR)
         processed_dir.mkdir(parents=True, exist_ok=True)
         
-        for split in ['train', 'validation', 'test']:
+        for split in ['train', 'validation', 'test', 'private_test']:
             # Save English
-            with open(processed_dir / f"{split}.en", 'w', encoding='utf-8') as f:
-                f.write('\n'.join(processed_data[split]['en']))
-            
-            # Save Vietnamese
-            with open(processed_dir / f"{split}.vi", 'w', encoding='utf-8') as f:
-                f.write('\n'.join(processed_data[split]['vi']))
+            if split == 'private_test':
+                with open(processed_dir / f"{split}.en", 'w', encoding='utf-8') as f:
+                    f.write('\n'.join(processed_data[split]['en']))
+                
+                # Save Vietnamese
+                with open(processed_dir / f"{split}.vi", 'w', encoding='utf-8') as f:
+                    f.write('\n'.join(processed_data[split]['vi']))
         
         print(f"\nDataset statistics:")
         print(f"Train: {len(processed_data['train']['en'])} pairs")
         print(f"Validation: {len(processed_data['validation']['en'])} pairs")
         print(f"Test: {len(processed_data['test']['en'])} pairs")
+        print(f"Private Test: {len(processed_data['private_test']['en'])} pairs")
         
         return processed_data
     
@@ -332,7 +340,7 @@ class DataProcessor:
         datasets = {}
         processed_dir = Path(Config.PROCESSED_DATA_DIR)
         
-        for split in ['train', 'validation', 'test']:
+        for split in ['train', 'validation', 'test', 'private_test']:
             # if split == 'train':
             # Check if cached tokenized IDs exist
             cache_file = processed_dir / f"{split}_tokenized.pkl"

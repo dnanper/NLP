@@ -91,7 +91,7 @@ except Exception as e:
     all_exist = False
 
 try:
-    from models_best import BestTransformer, TransformerConfig
+    from models_best_old import BestTransformer, TransformerConfig
     print("✓ import models_best.BestTransformer")
 except Exception as e:
     print(f"✗ import models_best.BestTransformer: {e}")

@@ -55,20 +55,18 @@ def evaluate_bleu(predictions, references):
     # We have one reference per example
     refs = [references]  # Wrap in list for sacreBleu format
     
-    # Calculate BLEU-4 (default) with different max_ngram_order
+    # Calculate BLEU for different n-grams using BLEU class
     for n in range(1, 5):
         try:
-            bleu = corpus_bleu(
-                predictions, 
-                refs,
+            # Use BLEU class with max_ngram_order parameter
+            bleu_metric = BLEU(
                 max_ngram_order=n,
-                smooth_method='exp',  # Exponential smoothing (recommended)
-                smooth_value=None,
-                force=False,
+                smooth_method='exp',
                 lowercase=False,
-                tokenize='13a',  # Standard tokenization for international text
-                use_effective_order=False
+                tokenize='13a',
+                effective_order=True
             )
+            bleu = bleu_metric.corpus_score(predictions, refs)
             
             results[f'bleu-{n}'] = bleu.score
             print(f"  BLEU-{n}: {bleu.score:.2f}")
@@ -101,7 +99,7 @@ def main():
     PROJECT_ROOT = Path(__file__).resolve().parent
     
     # Paths
-    JSONL_PATH = PROJECT_ROOT / "data" / "processed" / "test_predict.jsonl"
+    JSONL_PATH = PROJECT_ROOT / "data" / "processed" / "ep13_test_predict.jsonl"
     REFERENCE_PATH = PROJECT_ROOT / "data" / "processed" / "test.vi"
     
     print("=" * 80)
@@ -159,7 +157,7 @@ def main():
     print("=" * 80)
     
     # Save results
-    results_path = JSONL_PATH.parent / "evaluation_results.json"
+    results_path = JSONL_PATH.parent / "ep13_evaluation_results.json"
     with open(results_path, 'w', encoding='utf-8') as f:
         json.dump({
             'num_samples': len(predictions),

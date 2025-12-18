@@ -126,6 +126,65 @@ class Translator:
         
         return translation
     
+    def translate_batch_greedy(self, src_batch: torch.Tensor, max_len: int = 256) -> List[List[int]]:
+        """
+        Batch greedy decoding - processes entire batch in parallel
+        
+        Args:
+            src_batch: Source batch tensor [batch_size, src_len]
+            max_len: Maximum decode length
+            
+        Returns:
+            List of decoded token ID sequences
+        """
+        batch_size = src_batch.size(0)
+        device = src_batch.device
+        
+        # Create source mask
+        src_mask = (src_batch != self.processor.pad_idx).unsqueeze(1).unsqueeze(2)
+        
+        # Encode source batch once
+        memory = self.model.encoder(self.model.src_embed(src_batch), src_mask)
+        
+        # Start with BOS token for all sequences
+        decoder_input = torch.full((batch_size, 1), self.config.bos_idx, 
+                                   dtype=torch.long, device=device)
+        
+        # Track which sequences are finished
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        
+        for _ in range(max_len):
+            # Create causal mask
+            tgt_len = decoder_input.size(1)
+            tgt_mask = torch.tril(torch.ones((tgt_len, tgt_len), device=device))
+            tgt_mask = tgt_mask.unsqueeze(0).unsqueeze(0).bool()
+            
+            # Decode
+            tgt_embed = self.model.tgt_embed(decoder_input)
+            output = self.model.decoder(tgt_embed, memory, src_mask, tgt_mask)
+            logits = self.model.output_projection(output)
+            
+            # Get next token (greedy)
+            next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)  # [batch, 1]
+            
+            # Mark finished sequences (encountered EOS)
+            finished = finished | (next_token.squeeze(1) == self.config.eos_idx)
+            
+            # Append next token
+            decoder_input = torch.cat([decoder_input, next_token], dim=1)
+            
+            # Stop if all finished
+            if finished.all():
+                break
+        
+        # Convert to list of token IDs
+        results = []
+        for i in range(batch_size):
+            token_ids = decoder_input[i].cpu().tolist()
+            results.append(token_ids)
+        
+        return results
+    
     def translate_file(self, input_file: str, output_file: str,
                        beam_size: int = 5, use_greedy: bool = False,
                        batch_size: int = 1, save_jsonl: bool = True):
@@ -210,14 +269,11 @@ class Translator:
                 # Translate batch
                 with torch.no_grad():
                     if use_greedy:
-                        # Process one by one for greedy (model.translate_greedy expects single input)
-                        batch_translations = []
-                        for i in range(batch_tensor.size(0)):
-                            tgt_ids = self.model.translate_greedy(batch_tensor[i:i+1])
-                            translation = self.detokenize(tgt_ids)
-                            batch_translations.append(translation)
+                        # TRUE BATCH GREEDY - process entire batch in parallel
+                        batch_results = self.translate_batch_greedy(batch_tensor, max_len=256)
+                        batch_translations = [self.detokenize(tgt_ids) for tgt_ids in batch_results]
                     else:
-                        # Process one by one for beam search (model.translate_beam expects single input)
+                        # Beam search - process one by one (batching beam search is complex)
                         batch_translations = []
                         for i in range(batch_tensor.size(0)):
                             tgt_ids = self.model.translate_beam(
