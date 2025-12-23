@@ -22,5 +22,5 @@ This repository contains solutions for two main problems in Vietnamese-English N
 
 Please see the attached PDF reports for methodology, experiments, and results for each problem:
 
-**Problem 1 Report:** [Transformer.pdf](./Transformer.pdf)\
-**Problem 2 Report:** [Transformer.pdf](./Transformer.pdf)
+**Problem 1 Report:** [Problem_1.pdf](./Problem_1.pdf)\
+**Problem 2 Report:** [Problem_2.pdf](./Problem_2.pdf)
